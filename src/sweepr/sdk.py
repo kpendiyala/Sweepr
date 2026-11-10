@@ -1,24 +1,21 @@
-"""Training-side SDK.
+"""Training-side SDK: the few functions a training script calls.
 
-A training script calls `log`, `checkpoint`, and `finish`. Every call appends one JSON
-record to the file named by SWEEPR_METRICS_FILE, which the supervisor tails. When that
-variable is unset (the script was started without the supervisor), every call is a no-op,
-so the same script runs fine on its own.
+Every call appends one JSON record (one line) to the file named by SWEEPR_METRICS_FILE.
+The supervisor reads that file while the script runs. When the variable is not set (the
+script was started without the supervisor), every call does nothing, so the same script
+still runs on its own.
 
-A background thread also writes a heartbeat every few seconds. The heartbeat carries the
-time of the last `log` call, which lets the supervisor tell two cases apart:
-  - no heartbeats at all: the whole process is frozen or gone
-  - heartbeats, but `last_log_t` is stale: the process is alive but training is stuck
+A background thread also writes a heartbeat record every few seconds. Each heartbeat carries
+the time of the last `log` call, which lets the supervisor tell two problems apart:
+  - no records at all: the whole process is frozen or gone
+  - heartbeats keep coming, but no new metrics: the process is alive but training is stuck
 """
-
-from __future__ import annotations
 
 import atexit
 import json
 import os
 import threading
 import time
-from typing import Any
 
 METRICS_FILE_ENV = "SWEEPR_METRICS_FILE"
 RESUME_ENV = "SWEEPR_RESUME_FROM"
@@ -27,57 +24,58 @@ DEFAULT_HEARTBEAT_INTERVAL = 5.0
 
 
 class _Run:
-    """Writes records for the current process. Created lazily on the first SDK call."""
+    """Owns the metrics file and the heartbeat thread for the current process."""
 
-    def __init__(self, path: str | None, heartbeat_interval: float) -> None:
-        self._path = path
-        self._lock = threading.Lock()
-        self._file = open(path, "a", encoding="utf-8") if path else None  # noqa: SIM115
-        self._last_log_t: float | None = None
-        self._stop = threading.Event()
-        self._heartbeat: threading.Thread | None = None
-        if self._file is not None:
-            self._heartbeat = threading.Thread(
+    def __init__(self, path: str | None, heartbeat_interval: float):
+        # The heartbeat thread and the training code both write to the file,
+        # so every write holds this lock.
+        self.lock = threading.Lock()
+        self.file = None
+        self.last_log_t = None
+        self.stop_event = threading.Event()
+        self.heartbeat_thread = None
+
+        if path:
+            self.file = open(path, "a", encoding="utf-8")  # closed in close()
+            # daemon=True: this thread never keeps the process alive on its own.
+            self.heartbeat_thread = threading.Thread(
                 target=self._heartbeat_loop, args=(heartbeat_interval,), daemon=True
             )
-            self._heartbeat.start()
+            self.heartbeat_thread.start()
 
-    @property
-    def enabled(self) -> bool:
-        return self._file is not None
-
-    def write(self, record: dict[str, Any]) -> None:
-        if self._file is None:
-            return
-        record = {"t": time.time(), **record}
-        # NaN and inf are written as the bare tokens NaN/Infinity. That is not strict JSON,
-        # but Python's json module reads it back, and the supervisor needs to see NaN losses.
-        line = json.dumps(record, allow_nan=True)
-        with self._lock:
-            self._file.write(line + "\n")
-            # Flush on every write so the supervisor sees records immediately, and so
-            # nothing is lost in a buffer if the process is killed.
-            self._file.flush()
-
-    def log(self, metrics: dict[str, float], step: int | None) -> None:
-        self._last_log_t = time.time()
-        self.write({"type": "metric", "step": step, "data": metrics})
+    def write(self, record: dict) -> None:
+        with self.lock:
+            if self.file is None:
+                return
+            record["t"] = time.time()
+            # NaN and inf are written as the bare words NaN / Infinity. That is not strict
+            # JSON, but Python's json module reads it back, and the supervisor needs to see
+            # NaN losses.
+            self.file.write(json.dumps(record) + "\n")
+            # Flush every time, so the supervisor sees the record right away and nothing is
+            # stuck in a buffer if the process is killed.
+            self.file.flush()
 
     def _heartbeat_loop(self, interval: float) -> None:
-        while not self._stop.wait(interval):
-            self.write({"type": "heartbeat", "last_log_t": self._last_log_t})
+        while True:
+            # wait() sleeps for `interval` seconds, but returns True early if close() was called.
+            stopped = self.stop_event.wait(interval)
+            if stopped:
+                return
+            self.write({"type": "heartbeat", "last_log_t": self.last_log_t})
 
     def close(self) -> None:
-        self._stop.set()
-        if self._heartbeat is not None:
-            self._heartbeat.join(timeout=1)
-        with self._lock:
-            if self._file is not None:
-                self._file.close()
-                self._file = None
+        self.stop_event.set()
+        if self.heartbeat_thread is not None:
+            self.heartbeat_thread.join(timeout=1)
+        with self.lock:
+            if self.file is not None:
+                self.file.close()
+                self.file = None
 
 
-_run: _Run | None = None
+# One run per process, created on the first SDK call.
+_run = None
 _run_lock = threading.Lock()
 
 
@@ -87,13 +85,15 @@ def _get_run() -> _Run:
         if _run is None:
             interval = float(os.environ.get(HEARTBEAT_ENV, DEFAULT_HEARTBEAT_INTERVAL))
             _run = _Run(os.environ.get(METRICS_FILE_ENV), interval)
-            atexit.register(_run.close)
+            atexit.register(_run.close)  # close the file even if the script never calls finish()
         return _run
 
 
-def log(metrics: dict[str, float], step: int | None = None) -> None:
+def log(metrics: dict, step: int | None = None) -> None:
     """Record scalar metrics, for example `log({"loss": 0.31}, step=100)`."""
-    _get_run().log(metrics, step)
+    run = _get_run()
+    run.last_log_t = time.time()
+    run.write({"type": "metric", "step": step, "data": metrics})
 
 
 def checkpoint(path: str, step: int | None = None) -> None:
@@ -109,12 +109,12 @@ def finish() -> None:
 
 
 def resume_path() -> str | None:
-    """Checkpoint to resume from, if the supervisor is retrying this run. None on a fresh start."""
+    """The checkpoint to resume from when the supervisor is retrying this run, else None."""
     return os.environ.get(RESUME_ENV) or None
 
 
 def _reset_for_tests() -> None:
-    """Close and forget the current run so a test can start a fresh one."""
+    """Close and forget the current run, so each test starts fresh."""
     global _run
     with _run_lock:
         if _run is not None:
