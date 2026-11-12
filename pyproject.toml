@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "A self-healing supervisor for ML training sweeps"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["pyyaml>=6"]
 
 [project.scripts]
 supervise = "sweepr.cli:main"

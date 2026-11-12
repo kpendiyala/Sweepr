@@ -5,13 +5,12 @@ import pytest
 from sweepr import classify as classify_module
 from sweepr.classify import (
     CODE_BUG,
-    HEARTBEAT_TIMEOUT,
+    HANG_TIMEOUT,
     HUNG,
     NAN,
     NAN_LOSS,
     NODE_FAILURE,
     OOM,
-    PROGRESS_TIMEOUT,
     UNKNOWN,
     Evidence,
     classify,
@@ -28,10 +27,10 @@ def traceback_ending_in(last_line):
 CASES = [
     pytest.param(Evidence(0), None, id="clean exit"),
     # The supervisor's own kill decision wins over everything else.
-    pytest.param(Evidence(-9, killed_by=HEARTBEAT_TIMEOUT), HUNG, id="killed: frozen"),
+    pytest.param(Evidence(-9, killed_by=HANG_TIMEOUT), HUNG, id="killed: hung"),
     pytest.param(Evidence(-15, killed_by=NAN_LOSS), NAN, id="killed: nan loss"),
     pytest.param(
-        Evidence(-9, traceback_ending_in("CUDA out of memory"), killed_by=PROGRESS_TIMEOUT),
+        Evidence(-9, traceback_ending_in("CUDA out of memory"), killed_by=HANG_TIMEOUT),
         HUNG,
         id="hang kill beats OOM text",
     ),
@@ -54,12 +53,6 @@ CASES = [
     pytest.param(Evidence(-9), NODE_FAILURE, id="SIGKILL"),
     pytest.param(Evidence(137), NODE_FAILURE, id="SIGKILL via shell (128 + 9)"),
     pytest.param(Evidence(-11), UNKNOWN, id="SIGSEGV is not an outside kill"),
-    # Transient infrastructure errors
-    pytest.param(
-        Evidence(1, traceback_ending_in("RuntimeError: NCCL error in: socket timeout")),
-        NODE_FAILURE,
-        id="NCCL error",
-    ),
     # Deterministic code bugs
     pytest.param(
         Evidence(1, traceback_ending_in("TypeError: can only concatenate str")),

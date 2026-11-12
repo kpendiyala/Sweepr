@@ -1,6 +1,6 @@
 """End-to-end tests: supervise the real fault-injection script and check each outcome.
 
-Timeouts are scaled down (heartbeats every 0.05 s, kills after about 1 s) so the tests stay
+The hang timeout is scaled down to 1 s so the tests stay
 fast. Only the numbers are smaller; the logic is the same as with the real defaults.
 """
 
@@ -12,28 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from sweepr.classify import (
-    CODE_BUG,
-    HEARTBEAT_TIMEOUT,
-    HUNG,
-    NAN,
-    NAN_LOSS,
-    NODE_FAILURE,
-    OOM,
-    PROGRESS_TIMEOUT,
-)
+from sweepr.classify import CODE_BUG, HANG_TIMEOUT, HUNG, NAN, NAN_LOSS, NODE_FAILURE, OOM
 from sweepr.cli import main
 from sweepr.supervisor import MetricsReader, run_attempt
-from sweepr.watchdog import WatchdogConfig
 
 SCRIPT = Path(__file__).resolve().parents[1] / "examples" / "flaky_train.py"
-FAST = WatchdogConfig(heartbeat_timeout=1.0, progress_timeout=1.0)
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX signals")
-
-
-@pytest.fixture(autouse=True)
-def fast_heartbeats(monkeypatch):
-    monkeypatch.setenv("SWEEPR_HEARTBEAT_INTERVAL", "0.05")
 
 
 def flaky_command(tmp_path, *extra_args):
@@ -49,7 +33,7 @@ def supervise(tmp_path, command, attempt=1, resume_from=None):
         run_dir=tmp_path / "run",
         attempt=attempt,
         resume_from=resume_from,
-        config=FAST,
+        hang_timeout=1.0,
         poll_interval=0.05,
         stop_grace=1.0,
     )
@@ -104,11 +88,10 @@ def test_nan_loss_is_stopped_early(tmp_path):
     assert result.duration_s < 10
 
 
-def test_stuck_training_is_detected_by_progress_timeout(tmp_path):
-    # In hang mode the training loop freezes but the heartbeat thread keeps running.
+def test_hang_is_detected_when_metrics_stop(tmp_path):
     command = flaky_command(tmp_path, "--fail-mode", "hang", "--fail-step", "10")
     result = supervise(tmp_path, command)
-    assert result.killed_by == PROGRESS_TIMEOUT
+    assert result.killed_by == HANG_TIMEOUT
     assert result.classification.failure == HUNG
     assert result.last_step == 9
 
@@ -117,8 +100,9 @@ def test_stuck_training_is_detected_by_progress_timeout(tmp_path):
 
 
 @posix_only
-def test_frozen_process_is_detected_by_heartbeat_timeout(tmp_path):
-    # SIGSTOP freezes every thread, heartbeat included, like a wedged node.
+def test_frozen_process_is_detected(tmp_path):
+    # SIGSTOP freezes the whole process, like a wedged node. A frozen process can't answer
+    # signals either, so this also checks that stopping it falls back to SIGKILL.
     script = tmp_path / "freeze.py"
     script.write_text(
         textwrap.dedent("""
@@ -128,7 +112,7 @@ def test_frozen_process_is_detected_by_heartbeat_timeout(tmp_path):
         """)
     )
     result = supervise(tmp_path, [sys.executable, str(script)])
-    assert result.killed_by == HEARTBEAT_TIMEOUT
+    assert result.killed_by == HANG_TIMEOUT
     assert result.classification.failure == HUNG
 
 

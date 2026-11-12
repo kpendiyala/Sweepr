@@ -1,0 +1,23 @@
+# A 12-run demo sweep where half the runs fail on purpose, in every way Sweepr handles.
+#   supervise sweep examples/sweep.yaml
+#
+# Expected result, with no manual help (about a minute):
+#   oom, crash and hang runs recover: a halved batch size, or a retry that resumes from the
+#   latest checkpoint. nan and bug runs are not retried, because a retry can't fix them.
+#   -> 12/12 runs finished: 8 succeeded, 4 failed (NAN 2, CODE_BUG 2)
+
+# {name} comes from the grid. {run_dir} is the run's own folder, so runs never overwrite
+# each other's checkpoints.
+command: >-
+  python examples/flaky_train.py
+  --fail-mode {fail_mode} --lr {lr} --batch-size {batch_size}
+  --steps 60 --step-time 0.02 --fail-step 30 --ckpt-every 10
+  --ckpt-dir {run_dir}/ckpt
+
+grid:
+  fail_mode: [none, oom, crash, hang, nan, bug]
+  lr: [0.02, 0.05]
+  batch_size: [64]   # flaky_train.py "runs out of memory" above 32
+
+max_attempts: 3
+hang_timeout: 3      # short, so the demo doesn't wait long on the hung runs

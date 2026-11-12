@@ -1,23 +1,23 @@
 """Runs one attempt of a training command under supervision.
 
-`run_attempt` starts the command and then loops every `poll_interval` seconds:
-  1. read the new records from the metrics file and give them to the watchdog
-  2. stop if the process has exited
-  3. ask the watchdog whether the process should be killed (hung, frozen, NaN loss)
+`run_attempt` starts the command and then checks on it every `poll_interval` seconds:
+  1. read the new records from the metrics file
+  2. stop looping if the process has exited
+  3. stop the process if its loss went NaN, or if no new metric arrived for `hang_timeout`
 When the process is gone, it collects the evidence and asks the classifier what happened.
 """
 
 import json
+import math
 import os
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from sweepr.classify import Classification, Evidence, classify
+from sweepr.classify import HANG_TIMEOUT, NAN_LOSS, Classification, Evidence, classify
 from sweepr.process import kill_leftovers, start_process, stop_process
 from sweepr.sdk import METRICS_FILE_ENV, RESUME_ENV
-from sweepr.watchdog import Watchdog, WatchdogConfig
 
 ATTEMPT_ENV = "SWEEPR_ATTEMPT"
 LOG_TAIL_BYTES = 64 * 1024  # how much of the end of the log the classifier looks at
@@ -33,7 +33,6 @@ class AttemptResult:
     last_checkpoint: str | None  # where a retry can resume from
     duration_s: float
     log_path: Path
-    metrics_path: Path
 
 
 class MetricsReader:
@@ -83,13 +82,16 @@ def run_attempt(
     run_dir: Path,
     attempt: int = 1,
     resume_from: str | None = None,
-    config: WatchdogConfig | None = None,
+    hang_timeout: float = 300.0,
     poll_interval: float = 0.5,
     stop_grace: float = 10.0,
 ) -> AttemptResult:
-    """Run `cmd` once, stop it if it hangs or its loss goes NaN, and classify the result."""
-    if config is None:
-        config = WatchdogConfig()
+    """Run `cmd` once, stop it if it hangs or its loss goes NaN, and classify the result.
+
+    The hang check starts with the first metric the script logs. Before that, imports and
+    data loading can take any amount of time, and a script that doesn't use the SDK never
+    logs at all, so it is never treated as hung.
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / f"attempt-{attempt}.log"
     metrics_path = run_dir / f"attempt-{attempt}.metrics.jsonl"
@@ -109,26 +111,45 @@ def run_attempt(
     print(f"[sweepr] attempt {attempt} started (pid {proc.pid}), log: {log_path}", file=sys.stderr)
 
     reader = MetricsReader(metrics_path)
-    watchdog = Watchdog(config, started_at=started)
+    # What we have seen so far. Times come from our own time.monotonic() clock, never the
+    # `t` the script wrote: a wall clock can jump (NTP), a monotonic clock only moves forward.
+    last_metric_at = None
+    last_step = None
+    last_checkpoint = None
+    saw_nonfinite_loss = False
+    finished = False
     killed_by = None
+
     try:
         while True:
-            # Check for exit *before* reading, so the records written right before the
-            # exit are still read in this same pass.
+            # Check for exit *before* reading, so records written right before the exit are
+            # still read in this same pass.
             has_exited = proc.poll() is not None
             now = time.monotonic()
             for record in reader.read_new():
-                watchdog.observe(record, now)
+                if record.get("type") == "metric":
+                    last_metric_at = now
+                    if record.get("step") is not None:
+                        last_step = record["step"]
+                    loss = (record.get("data") or {}).get("loss")
+                    if isinstance(loss, (int, float)) and not math.isfinite(loss):
+                        saw_nonfinite_loss = True
+                elif record.get("type") == "checkpoint":
+                    last_checkpoint = record.get("path")
+                elif record.get("type") == "finish":
+                    finished = True  # training is done; let it exit without a hang check
             if has_exited:
                 break
 
-            if killed_by is None:
-                reason = watchdog.check(now)
-                if reason is not None:
-                    killed_by = reason
-                    print(f"[sweepr] attempt {attempt}: {reason}, stopping it", file=sys.stderr)
-                    stop_process(proc, stop_grace)
-                    continue  # the process is gone now; the next pass reads its last records
+            if saw_nonfinite_loss:
+                killed_by = NAN_LOSS
+            elif not finished and last_metric_at is not None:
+                if now - last_metric_at > hang_timeout:
+                    killed_by = HANG_TIMEOUT
+            if killed_by is not None:
+                print(f"[sweepr] attempt {attempt}: {killed_by}, stopping it", file=sys.stderr)
+                stop_process(proc, stop_grace)
+                break
 
             time.sleep(poll_interval)
     finally:
@@ -142,7 +163,7 @@ def run_attempt(
     evidence = Evidence(
         exit_code=proc.returncode,
         log_tail=read_end_of_file(log_path, LOG_TAIL_BYTES),
-        saw_nonfinite_loss=watchdog.saw_nonfinite_loss,
+        saw_nonfinite_loss=saw_nonfinite_loss,
         killed_by=killed_by,
     )
     return AttemptResult(
@@ -150,11 +171,10 @@ def run_attempt(
         classification=classify(evidence),
         exit_code=proc.returncode,
         killed_by=killed_by,
-        last_step=watchdog.last_step,
-        last_checkpoint=watchdog.last_checkpoint,
+        last_step=last_step,
+        last_checkpoint=last_checkpoint,
         duration_s=time.monotonic() - started,
         log_path=log_path,
-        metrics_path=metrics_path,
     )
 
 

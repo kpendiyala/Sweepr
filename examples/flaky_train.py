@@ -6,7 +6,7 @@ and CI stay fast) and can be told to fail in each way the supervisor must handle
   --fail-mode oom    raise a CUDA-style out-of-memory error when --batch-size > --oom-above,
                      so retrying with a smaller batch size actually fixes it
   --fail-mode nan    the loss diverges to NaN at --fail-step and stays there
-  --fail-mode hang   the training loop freezes at --fail-step (heartbeats keep going)
+  --fail-mode hang   the training loop freezes at --fail-step (no more metrics)
   --fail-mode crash  the process is killed (SIGKILL) at --fail-step, like a node going away
   --fail-mode bug    a TypeError on startup, which no retry will fix
 

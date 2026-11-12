@@ -18,13 +18,12 @@ IS_WINDOWS = sys.platform == "win32"
 OOM = "OOM"  # out of GPU or host memory; retrying with a smaller batch can fix it
 NAN = "NAN"  # loss became NaN or inf; retrying the same config won't help
 HUNG = "HUNG"  # stopped making progress; the supervisor killed it
-NODE_FAILURE = "NODE_FAILURE"  # killed from outside or a transient infra error; retry
+NODE_FAILURE = "NODE_FAILURE"  # killed from outside (lost node, preemption); retry
 CODE_BUG = "CODE_BUG"  # a deterministic error; it fails the same way every time
-UNKNOWN = "UNKNOWN"  # failed, but no rule is confident about why
+UNKNOWN = "UNKNOWN"  # failed, but no rule is confident about why; retry
 
-# Why the supervisor itself stopped the process (set by the watchdog).
-HEARTBEAT_TIMEOUT = "heartbeat_timeout"  # no records at all: process frozen or gone
-PROGRESS_TIMEOUT = "progress_timeout"  # heartbeats, but no new metrics: training stuck
+# Why the supervisor itself stopped the process.
+HANG_TIMEOUT = "hang_timeout"  # no new metrics for too long: frozen or stuck
 NAN_LOSS = "nan_loss"  # stopped early because the loss went NaN
 
 
@@ -52,19 +51,6 @@ OOM_PATTERNS = [
     "CUBLAS_STATUS_ALLOC_FAILED",
     "RESOURCE_EXHAUSTED",
     "MemoryError",
-]
-
-# Errors that come from the environment rather than the code, so a retry can succeed.
-TRANSIENT_PATTERNS = [
-    "NCCL error",
-    "ECC error",
-    "ConnectionError",
-    "ConnectionResetError",
-    "ConnectionRefusedError",
-    "ConnectionAbortedError",
-    "TimeoutError",
-    "BrokenPipeError",
-    "Stale file handle",
 ]
 
 # Exception types that fail the same way on every attempt. Anything not listed is UNKNOWN,
@@ -100,10 +86,10 @@ def classify(evidence: Evidence) -> Classification:
     # 1. The supervisor's own decision is the strongest evidence we have.
     if evidence.killed_by == NAN_LOSS:
         return Classification(NAN, "stopped early: loss became NaN/inf")
-    if evidence.killed_by in (HEARTBEAT_TIMEOUT, PROGRESS_TIMEOUT):
-        return Classification(HUNG, f"killed by supervisor: {evidence.killed_by}")
+    if evidence.killed_by == HANG_TIMEOUT:
+        return Classification(HUNG, "killed by supervisor: no new metrics")
 
-    # 2. An OOM also prints a traceback, so this must come before the traceback rule (6).
+    # 2. An OOM also prints a traceback, so this must come before the traceback rule (5).
     if code != 0:
         oom_text = find_first_pattern(OOM_PATTERNS, log)
         if oom_text is not None:
@@ -122,12 +108,7 @@ def classify(evidence: Evidence) -> Classification:
     if signal_number is not None:
         return Classification(NODE_FAILURE, f"killed by signal {signal_number}")
 
-    # 5. Transient infrastructure errors. These may also print a traceback.
-    transient_text = find_first_pattern(TRANSIENT_PATTERNS, log)
-    if transient_text is not None:
-        return Classification(NODE_FAILURE, f"transient error: {transient_text}")
-
-    # 6. A traceback whose exception type is known to be deterministic.
+    # 5. A traceback whose exception type is known to be deterministic.
     exception = last_exception_type(log)
     if exception in DETERMINISTIC_EXCEPTIONS:
         return Classification(CODE_BUG, f"{exception} (fails the same way on retry)")
