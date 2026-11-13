@@ -4,7 +4,7 @@ A self-healing supervisor for ML training sweeps. It watches every run in a swee
 why a run failed (out of memory, NaN loss, hung, node failure, or a code bug), and applies the
 recovery you configured, so you stop babysitting runs.
 
-> Work in progress. Single runs and self-healing sweeps work; a run history database is next.
+> Work in progress. Single runs, self-healing sweeps and run history work; failure notifications are next.
 
 ## Development
 
@@ -75,6 +75,24 @@ Runs go one at a time. When an attempt fails, the retry rules are:
 Every retry resumes from the run's latest checkpoint, and a run stops after `max_attempts`.
 `{run_dir}` is each run's own folder, so runs never overwrite each other's checkpoints.
 
+## Look back at past sweeps
+
+Every sweep, run and attempt is saved in a SQLite database, `runs/sweepr.db`, as the sweep
+goes. If a sweep is interrupted, the database still holds everything that finished.
+
+```bash
+supervise history       # recent sweeps with their counts
+# id  started              runs   succeeded  failed  name
+# 1   2026-11-13 13:33:15  12/12  8          4       sweep
+
+supervise history 1     # the runs of sweep 1
+# run-003  succeeded        2 attempt(s)  fail_mode=oom lr=0.02 batch_size=32
+# run-011  failed CODE_BUG  1 attempt(s)  fail_mode=bug lr=0.02 batch_size=64
+```
+
+The schema has three tables: `sweeps`, `runs` (one per grid combination) and `attempts`
+(one per try of a run). See `src/sweepr/store.py`.
+
 ## How the code is organized
 
 | File | What it does |
@@ -84,7 +102,8 @@ Every retry resumes from the run's latest checkpoint, and a run stops after `max
 | `src/sweepr/supervisor.py` | `run_attempt`: starts the command, reads the metrics file, stops it if it hangs or goes NaN, classifies the result |
 | `src/sweepr/classify.py` | Failure classifier with no I/O: OOM, NAN, HUNG, NODE_FAILURE, CODE_BUG, UNKNOWN |
 | `src/sweepr/sweep.py` | Sweep files, the retry rules, and running each grid combination with retries |
-| `src/sweepr/cli.py` | `supervise run [options] -- <command>` and `supervise sweep <file>` (argparse) |
+| `src/sweepr/store.py` | Run history in SQLite: the schema, saving results, and the history queries |
+| `src/sweepr/cli.py` | `supervise run`, `supervise sweep` and `supervise history` (argparse) |
 
 ## Instrumenting your own script
 

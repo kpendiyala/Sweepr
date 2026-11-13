@@ -1,17 +1,20 @@
-"""Command line: `supervise run [options] -- <command>` and `supervise sweep <file>`."""
+"""Command line: the `supervise run`, `supervise sweep` and `supervise history` commands."""
 
 import argparse
+import json
 import secrets
 import sys
 import time
 from pathlib import Path
 
+from sweepr import store
 from sweepr.supervisor import AttemptResult, run_attempt
 from sweepr.sweep import SweepFileError, describe_run, load_sweep, run_sweep
 
 EXAMPLES = """examples:
   supervise run -- python examples/flaky_train.py --fail-mode crash
-  supervise sweep examples/sweep.yaml"""
+  supervise sweep examples/sweep.yaml
+  supervise history"""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,7 +46,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sweep.add_argument("sweep_file", help="path to a sweep .yaml file")
     sweep.add_argument("--runs-dir", default="runs", help="where each sweep's folder goes")
+
+    history = commands.add_parser(
+        "history",
+        help="list past sweeps, or the runs of one sweep",
+        description="Without an id, list recent sweeps. With an id, list that sweep's runs.",
+    )
+    history.add_argument("sweep_id", nargs="?", type=int, help="a sweep id from the list")
+    history.add_argument("--runs-dir", default="runs", help="the folder holding sweepr.db")
     return parser
+
+
+def database_path(runs_dir: str) -> Path:
+    """The run history lives next to the run folders: runs/sweepr.db."""
+    return Path(runs_dir) / "sweepr.db"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -66,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "sweep":
             return sweep_command(args, stamp)
+        if args.command == "history":
+            return history_command(args)
         if not command:
             parser.error("give the training command after --")
         result = run_attempt(
@@ -94,13 +112,53 @@ def sweep_command(args, stamp: str) -> int:
     except (SweepFileError, OSError) as error:
         print(f"supervise sweep: {error}", file=sys.stderr)
         return 2
-    results = run_sweep(sweep, Path(args.runs_dir) / f"{sweep.name}-{stamp}")
+    db = store.connect(database_path(args.runs_dir))
+    try:
+        results = run_sweep(sweep, Path(args.runs_dir) / f"{sweep.name}-{stamp}", db)
+    finally:
+        db.close()
     print()
     for result in results:
         print(describe_run(result))
     if all(result.succeeded for result in results):
         return 0
     return 1
+
+
+def history_command(args) -> int:
+    path = database_path(args.runs_dir)
+    if not path.exists():
+        print(f"supervise history: no history yet ({path} doesn't exist)", file=sys.stderr)
+        return 1
+    db = store.connect(path)
+    try:
+        if args.sweep_id is None:
+            print("id  started              runs   succeeded  failed  name")
+            rows = store.list_sweeps(db)
+            for row in rows:
+                runs = f"{row['runs_started']}/{row['total_runs']}"
+                if row["finished_at"] is None:
+                    runs += "*"  # stopped early (Ctrl-C or a crash)
+                print(
+                    f"{row['id']:<3} {row['started_at']}  {runs:<6} "
+                    f"{row['succeeded']:<10} {row['failed']:<7} {row['name']}"
+                )
+            if any(row["finished_at"] is None for row in rows):
+                print("* = did not finish")
+        else:
+            rows = store.list_runs(db, args.sweep_id)
+            if not rows:
+                print(f"supervise history: no sweep with id {args.sweep_id}", file=sys.stderr)
+                return 1
+            for row in rows:
+                status = row["status"]
+                if row["failure"]:
+                    status += f" {row['failure']}"
+                params = " ".join(f"{k}={v}" for k, v in json.loads(row["params"]).items())
+                print(f"{row['name']}  {status:<16} {row['attempts']} attempt(s)  {params}")
+    finally:
+        db.close()
+    return 0
 
 
 def summarize(result: AttemptResult) -> str:

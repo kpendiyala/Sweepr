@@ -9,7 +9,7 @@
 # {name} comes from the grid. {run_dir} is the run's own folder, so runs never overwrite
 # each other's checkpoints.
 command: >-
-  python examples/flaky_train.py
+  .venv/Scripts/python.exe examples/flaky_train.py
   --fail-mode {fail_mode} --lr {lr} --batch-size {batch_size}
   --steps 60 --step-time 0.02 --fail-step 30 --ckpt-every 10
   --ckpt-dir {run_dir}/ckpt

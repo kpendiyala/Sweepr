@@ -15,12 +15,14 @@ can't fix, or reaches max_attempts. Every retry resumes from the run's latest ch
 
 import itertools
 import shlex
+import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
+from sweepr import store
 from sweepr.classify import CODE_BUG, NAN, OOM
 from sweepr.supervisor import AttemptResult, run_attempt
 
@@ -149,10 +151,15 @@ def run_with_retries(
     sweep: Sweep,
     params: dict,
     run_dir: Path,
+    db: sqlite3.Connection,
+    run_id: int,
     poll_interval: float = 0.5,
     stop_grace: float = 10.0,
 ) -> RunResult:
-    """Run one grid combination until it succeeds or plan_retry says to give up."""
+    """Run one grid combination until it succeeds or plan_retry says to give up.
+
+    Each attempt is saved to the database as soon as it ends.
+    """
     attempts = []
     latest_checkpoint = None
     attempt = 0
@@ -169,6 +176,7 @@ def run_with_retries(
             stop_grace=stop_grace,
         )
         attempts.append(result)
+        store.save_attempt(db, run_id, command, result)
         # Keep the newest checkpoint across attempts: an attempt that dies before saving
         # one should still resume from the one before it.
         if result.last_checkpoint:
@@ -190,16 +198,33 @@ def run_with_retries(
 
 
 def run_sweep(
-    sweep: Sweep, sweep_dir: Path, poll_interval: float = 0.5, stop_grace: float = 10.0
+    sweep: Sweep,
+    sweep_dir: Path,
+    db: sqlite3.Connection,
+    poll_interval: float = 0.5,
+    stop_grace: float = 10.0,
 ) -> list[RunResult]:
     """Run every grid combination, one after another, and return how each run ended."""
     combinations = grid_combinations(sweep.grid)
     print(f"[sweepr] sweep {sweep.name}: {len(combinations)} runs in {sweep_dir}", file=sys.stderr)
+    sweep_id = store.start_sweep(db, sweep.name, sweep_dir, len(combinations))
     results = []
     for number, params in enumerate(combinations, start=1):
         run_dir = sweep_dir / f"run-{number:03d}"
-        results.append(run_with_retries(sweep, params, run_dir, poll_interval, stop_grace))
+        run_id = store.start_run(db, sweep_id, run_dir.name, params)
+        try:
+            result = run_with_retries(sweep, params, run_dir, db, run_id, poll_interval, stop_grace)
+        except KeyboardInterrupt:
+            store.finish_run(db, run_id, "interrupted", params, reason="stopped by Ctrl-C")
+            raise
+        if result.succeeded:
+            store.finish_run(db, run_id, "succeeded", result.params, reason=result.reason)
+        else:
+            store.finish_run(db, run_id, "failed", result.params, result.failure, result.reason)
+        results.append(result)
         print(f"[sweepr] {summary_line(results, len(combinations))}", file=sys.stderr)
+    store.finish_sweep(db, sweep_id)
+    print(f"[sweepr] saved as sweep {sweep_id}: supervise history {sweep_id}", file=sys.stderr)
     return results
 
 
