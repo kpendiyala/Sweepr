@@ -4,7 +4,7 @@ A self-healing supervisor for ML training sweeps. It watches every run in a swee
 why a run failed (out of memory, NaN loss, hung, node failure, or a code bug), and applies the
 recovery you configured, so you stop babysitting runs.
 
-> Work in progress. Single runs, self-healing sweeps and run history work; failure notifications are next.
+> v0.1: supervised runs, self-healing sweeps, run history, and failure alerts. A web dashboard is next.
 
 ## Development
 
@@ -93,6 +93,26 @@ supervise history 1     # the runs of sweep 1
 The schema has three tables: `sweeps`, `runs` (one per grid combination) and `attempts`
 (one per try of a run). See `src/sweepr/store.py`.
 
+## Get alerted when a person is needed
+
+```bash
+export SWEEPR_WEBHOOK_URL=https://hooks.slack.com/services/...   # PowerShell: $env:SWEEPR_WEBHOOK_URL = "..."
+supervise sweep examples/sweep.yaml
+```
+
+If any run gives up, Sweepr sends one message when the sweep ends:
+
+```
+Sweepr: sweep 'sweep' needs attention.
+12/12 runs finished: 8 succeeded, 4 failed (NAN 2, CODE_BUG 2)
+- run-009 NAN: NAN: retrying won't help (log: runs/.../run-009/attempt-1.log)
+...
+Details: supervise history 1
+```
+
+Runs that recovered on their own, and sweeps where everything succeeded, send nothing. The URL
+is an environment variable rather than part of the sweep file, so it never ends up in git.
+
 ## How the code is organized
 
 | File | What it does |
@@ -103,6 +123,7 @@ The schema has three tables: `sweeps`, `runs` (one per grid combination) and `at
 | `src/sweepr/classify.py` | Failure classifier with no I/O: OOM, NAN, HUNG, NODE_FAILURE, CODE_BUG, UNKNOWN |
 | `src/sweepr/sweep.py` | Sweep files, the retry rules, and running each grid combination with retries |
 | `src/sweepr/store.py` | Run history in SQLite: the schema, saving results, and the history queries |
+| `src/sweepr/notify.py` | One webhook message per sweep that has failed runs (standard library only) |
 | `src/sweepr/cli.py` | `supervise run`, `supervise sweep` and `supervise history` (argparse) |
 
 ## Instrumenting your own script

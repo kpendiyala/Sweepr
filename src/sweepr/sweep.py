@@ -22,7 +22,7 @@ from pathlib import Path
 
 import yaml
 
-from sweepr import store
+from sweepr import notify, store
 from sweepr.classify import CODE_BUG, NAN, OOM
 from sweepr.supervisor import AttemptResult, run_attempt
 
@@ -224,6 +224,8 @@ def run_sweep(
         results.append(result)
         print(f"[sweepr] {summary_line(results, len(combinations))}", file=sys.stderr)
     store.finish_sweep(db, sweep_id)
+    failed = [result for result in results if not result.succeeded]
+    notify.notify_if_needed(sweep.name, sweep_id, summary_line(results, len(results)), failed)
     print(f"[sweepr] saved as sweep {sweep_id}: supervise history {sweep_id}", file=sys.stderr)
     return results
 

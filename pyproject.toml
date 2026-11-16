@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sweepr"
-version = "0.0.1"
+version = "0.1.0"
 description = "A self-healing supervisor for ML training sweeps"
 readme = "README.md"
 requires-python = ">=3.10"
